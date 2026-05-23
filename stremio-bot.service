@@ -1,0 +1,22 @@
+[Unit]
+Description=Stremio Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Troque pelo usuário Linux que vai rodar o bot.
+User=SEU_USUARIO_LINUX
+Group=SEU_USUARIO_LINUX
+# Ajuste o caminho se você instalar o projeto fora de /opt/stremio-bot.
+WorkingDirectory=/opt/stremio-bot
+EnvironmentFile=/opt/stremio-bot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/stremio-bot/venv/bin/python /opt/stremio-bot/bot.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
