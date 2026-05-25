@@ -14,7 +14,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from secrets import token_urlsafe
 from typing import Any, Callable, Awaitable
+from dataclasses import dataclass
 from urllib.parse import quote_plus
+from logging.handlers import RotatingFileHandler
 
 import httpx
 from dotenv import load_dotenv
@@ -30,6 +32,9 @@ from telegram.ext import (
     filters,
 )
 
+from stremio_utils import find_subtitles
+from stremio_utils import rename_subtitle_to_match
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", str(BASE_DIR / "downloads"))).expanduser().resolve()
@@ -37,6 +42,9 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "cache_db" / "cache.db"))).ex
 LOG_DIR = BASE_DIR / "logs"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DEFAULT_QUALITY = os.getenv("DEFAULT_QUALITY", "1080p").strip().lower() or "1080p"
+KEEP_SUBTITLE_COPY = os.getenv("KEEP_SUBTITLE_COPY", "false").strip().lower() in {"1", "true", "yes", "on"}
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "3"))
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS = {
     int(part.strip())
@@ -46,10 +54,30 @@ ALLOWED_USERS = {
 
 MOVIE_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v"}
 VIDEO_LIMIT_BYTES = (2 * 1024**3) - (50 * 1024**2)
+TWO_GB_BYTES = 2 * 1024**3
 SEARCH_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 STREAM_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 USER_STATE: dict[int, dict[str, Any]] = {}
 DOWNLOAD_LOCKS: dict[str, asyncio.Lock] = {}
+SUB_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+COMPRESSION_QUEUE: asyncio.Queue | None = None
+
+
+@dataclass
+class CompressionTask:
+    video_file: str
+    dest_dir: str
+    chat_id: int
+    status_message_id: int
+    download_id: int
+    imdb_id: str
+    season: int | None
+    episode: int | None
+    quality: str
+    user_id: int
+    query: str
+
+
 TIMEOUT_MESSAGES = {
     "cinemeta": "⏳ Serviço lento, tente novamente em instantes.",
     "torrentio": "⏳ Torrentio não respondeu. Tente novamente.",
@@ -58,11 +86,17 @@ TIMEOUT_MESSAGES = {
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        LOG_DIR / "bot.log",
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
-            logging.FileHandler(LOG_DIR / "bot.log", encoding="utf-8"),
+            file_handler,
             logging.StreamHandler(),
         ],
     )
@@ -212,6 +246,7 @@ def get_db_connection() -> sqlite3.Connection:
 
 def init_db() -> None:
     connection = get_db_connection()
+    enqueued_compression = False
     try:
         cursor = connection.cursor()
         cursor.execute(
@@ -435,6 +470,12 @@ def cache_stream_results(results: list[dict[str, Any]]) -> str:
     return token
 
 
+def cache_sub_results(data: dict[str, Any]) -> str:
+    token = token_urlsafe(6)
+    SUB_CACHE[token] = (datetime.now(timezone.utc).timestamp(), data)
+    return token
+
+
 def get_cached_results(cache: dict[str, tuple[float, list[dict[str, Any]]]], token: str, ttl_seconds: int = 1800) -> list[dict[str, Any]] | None:
     item = cache.get(token)
     if not item:
@@ -558,6 +599,7 @@ async def run_aria2c(
         if process.stderr:
             stderr = (await process.stderr.read()).decode("utf-8", errors="ignore")
         raise RuntimeError(stderr.strip() or f"aria2c falhou com código {process.returncode}")
+    
 
 
 def locate_video_file(directory: Path) -> Path:
@@ -580,6 +622,152 @@ def build_magnet(stream: dict[str, Any]) -> str:
         if isinstance(tracker, str) and tracker.startswith("tracker:"):
             magnet += f"&tr={quote_plus(tracker.removeprefix('tracker:'))}"
     return magnet
+
+
+async def compress_video(input_path: Path, target_dir: Path) -> Path:
+    if shutil.which("ffmpeg") is None:
+        raise FileNotFoundError("ffmpeg não instalado. Rode: sudo apt install ffmpeg")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    output = target_dir / (input_path.stem + "_compressed.mp4")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        str(output),
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        await asyncio.wait_for(process.wait(), timeout=3600)
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise TimeoutError("Compressão excedeu o tempo limite") from exc
+    if process.returncode != 0:
+        stderr = ""
+        if process.stderr:
+            stderr = (await process.stderr.read()).decode("utf-8", errors="ignore")
+        raise RuntimeError(stderr.strip() or f"ffmpeg falhou com código {process.returncode}")
+    return output
+
+
+async def compression_worker(bot) -> None:
+    """Worker que processa compressões enfileiradas sequencialmente."""
+    global COMPRESSION_QUEUE
+    if COMPRESSION_QUEUE is None:
+        COMPRESSION_QUEUE = asyncio.Queue()
+    queue = COMPRESSION_QUEUE
+    while True:
+        task: CompressionTask = await queue.get()
+        try:
+            # notify user
+            try:
+                await bot.edit_message_text(chat_id=task.chat_id, message_id=task.status_message_id, text="🛠️ Compressão em andamento...")
+            except Exception:
+                pass
+            try:
+                compressed = await compress_video(Path(task.video_file), Path(task.dest_dir))
+                compressed_size = compressed.stat().st_size
+                if compressed_size <= VIDEO_LIMIT_BYTES:
+                    # update cache to point to compressed file
+                    db_save_cache(task.query, task.imdb_id, task.season, task.episode, task.quality, str(compressed), compressed_size, None)
+                    try:
+                        await bot.edit_message_text(chat_id=task.chat_id, message_id=task.status_message_id, text="📤 Enviando vídeo comprimido no Telegram...")
+                    except Exception:
+                        pass
+                    file_id, sent = await maybe_send_video(bot, task.chat_id, compressed, None)
+                    if sent and file_id:
+                        cache_row = db_find_cache_row(task.imdb_id, task.season, task.episode, task.quality)
+                        if cache_row:
+                            db_update_tg_file_id(int(cache_row["id"]), file_id)
+                    await bot.send_message(chat_id=task.chat_id, text=f"✅ Compressão e envio concluídos: {compressed.name}")
+                    db_update_download(task.download_id, "done")
+                else:
+                    # still too big
+                    db_save_cache(task.query, task.imdb_id, task.season, task.episode, task.quality, task.video_file, Path(task.video_file).stat().st_size, None)
+                    await bot.send_message(chat_id=task.chat_id, text=("⚠️ Arquivo permanece acima do limite mesmo após compressão. "
+                                                                          f"Arquivo salvo em: {task.video_file}"))
+                    db_update_download(task.download_id, "done")
+            except FileNotFoundError as exc:
+                await bot.send_message(chat_id=task.chat_id, text=f"❌ {exc}")
+                db_update_download(task.download_id, "failed")
+            except Exception:
+                logger.exception("Erro na compressão em background")
+                await bot.send_message(chat_id=task.chat_id, text="❌ Falha na compressão em background.")
+                db_update_download(task.download_id, "failed")
+        finally:
+            # release locks for this content and user
+            try:
+                content_lock = download_lock(f"{task.imdb_id}:{task.season or 0}:{task.episode or 0}:{task.quality}")
+                if content_lock.locked():
+                    try:
+                        content_lock.release()
+                    except RuntimeError:
+                        pass
+            except Exception:
+                pass
+            try:
+                user_lock = download_lock(f"user:{task.user_id}")
+                if user_lock.locked():
+                    try:
+                        user_lock.release()
+                    except RuntimeError:
+                        pass
+            except Exception:
+                pass
+            queue.task_done()
+
+
+def get_subtitle_files(directory: Path) -> list[Path]:
+    files = [p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in {".srt", ".ass"}]
+    files.sort(key=lambda p: p.name.lower())
+    return files
+
+
+async def sub_selection_watchdog(token: str, timeout_seconds: int, bot) -> None:
+    await asyncio.sleep(timeout_seconds)
+    data = get_cached_results(SUB_CACHE, token)
+    if not data:
+        return
+    # proceed without subtitle
+    try:
+        video_file = Path(data.get("video_file"))
+        chat_id = data.get("chat_id")
+        download_id = data.get("download_id")
+        user_id = data.get("user_id")
+        file_id, sent = await maybe_send_video(bot, chat_id, video_file, None)
+        if sent and file_id:
+            # update DB tg_file_id
+            cache_row = db_find_cache_row(data.get("imdb_id", ""), data.get("season"), data.get("episode"), data.get("quality"))
+            if cache_row:
+                db_update_tg_file_id(int(cache_row["id"]), file_id)
+        db_update_download(download_id, "done")
+    except Exception:
+        logger.exception("Falha ao enviar vídeo após watchdog de legenda")
+        db_update_download(download_id, "failed")
+    finally:
+        # release user lock
+        user_lock = download_lock(f"user:{user_id}")
+        if user_lock.locked():
+            try:
+                user_lock.release()
+            except RuntimeError:
+                pass
+        SUB_CACHE.pop(token, None)
 
 
 async def maybe_send_video(bot, chat_id: int, file_path: Path, tg_file_id: str | None) -> tuple[str | None, bool]:
@@ -609,6 +797,25 @@ async def maybe_send_video(bot, chat_id: int, file_path: Path, tg_file_id: str |
         if tg_file_id and "FILE_REFERENCE_EXPIRED" in str(exc).upper():
             return None, False
         raise
+
+
+def should_keep_subtitle_copy() -> bool:
+    return os.getenv("KEEP_SUBTITLE_COPY", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def send_subtitle_document(bot, chat_id: int, video_path: Path, subtitle_path: Path, keep_copy: bool | None = None) -> Path:
+    renamed = rename_subtitle_to_match(video_path, subtitle_path)
+    try:
+        await bot.send_document(chat_id=chat_id, document=renamed)
+    finally:
+        if keep_copy is None:
+            keep_copy = should_keep_subtitle_copy()
+        if not keep_copy:
+            try:
+                Path(renamed).unlink(missing_ok=True)
+            except Exception:
+                logger.exception("Falha ao remover legenda temporária %s", renamed)
+    return Path(renamed)
 
 
 def build_search_keyboard(token: str, metas: list[dict[str, Any]]) -> InlineKeyboardMarkup:
@@ -767,6 +974,14 @@ async def download_and_send(
     if cache_row:
         await send_cached_video(context, message, cache_row)
         return
+    # enforce single active download per user
+    user_lock_key = f"user:{user.id}"
+    user_lock = download_lock(user_lock_key)
+    if user_lock.locked():
+        await message.reply_text("⏳ Você já tem um download em andamento. Aguarde terminar antes de iniciar outro.")
+        return
+    await user_lock.acquire()
+    release_user_lock = True
     content_key = f"{imdb_id}:{season or 0}:{episode or 0}:{quality}"
     lock = download_lock(content_key)
     if lock.locked():
@@ -786,15 +1001,85 @@ async def download_and_send(
         await run_aria2c(source, dest_dir, select_file=select_file)
         video_file = locate_video_file(dest_dir)
         file_size = video_file.stat().st_size
-        if file_size > VIDEO_LIMIT_BYTES:
+        # se o arquivo estiver maior que 2 GB, enfileirar compressão automática e não bloquear o handler
+        if file_size > TWO_GB_BYTES:
+            # salvar cache provisório apontando para o arquivo original
             db_save_cache(meta.get("name", imdb_id), imdb_id, season, episode, quality, str(video_file), file_size, None)
-            await status_message.edit_text(
-                "⚠️ Arquivo acima do limite da Bot API. Envie manualmente a partir do caminho local:\n"
-                f"{video_file}"
+            # prepare compression task
+            global COMPRESSION_QUEUE
+            if COMPRESSION_QUEUE is None:
+                COMPRESSION_QUEUE = asyncio.Queue()
+            task = CompressionTask(
+                video_file=str(video_file),
+                dest_dir=str(dest_dir),
+                chat_id=message.chat_id,
+                status_message_id=status_message.message_id,
+                download_id=download_id,
+                imdb_id=imdb_id,
+                season=season,
+                episode=episode,
+                quality=quality,
+                user_id=user.id,
+                query=meta.get("name", imdb_id),
             )
-            db_update_download(download_id, "done")
+            await COMPRESSION_QUEUE.put(task)
+            enqueued_compression = True
+            release_user_lock = False
+            await status_message.edit_text("🛠️ Arquivo grande; compressão enfileirada. Você será notificado quando terminar.")
             return
         db_save_cache(meta.get("name", imdb_id), imdb_id, season, episode, quality, str(video_file), file_size, None)
+        # detect subtitle files (prioritize pt-br/pt)
+        subtitle_files = find_subtitles(dest_dir)
+        if subtitle_files:
+            # check environment preference for automatic subtitle selection
+            pref = os.getenv("SUB_LANG", "pt-br,pt") or "pt-br,pt"
+            preferred = [p.strip().lower() for p in pref.split(",") if p.strip()]
+            chosen_idx = None
+            for lang in preferred:
+                for idx, info in enumerate(subtitle_files):
+                    if info.get("lang") == lang:
+                        chosen_idx = idx
+                        break
+                if chosen_idx is not None:
+                    break
+            if chosen_idx is not None:
+                # automatic send preferred subtitle (rename to match video)
+                sub_info = subtitle_files[chosen_idx]
+                sub_path = Path(sub_info.get("path"))
+                try:
+                    renamed = await send_subtitle_document(context.bot, message.chat_id, video_file, sub_path)
+                    await status_message.edit_text(f"📎 Enviando legenda preferida: {renamed.name}")
+                except Exception:
+                    logger.exception("Falha ao enviar legenda preferida")
+                # continue to send video afterwards
+            else:
+                token = cache_sub_results({
+                    "video_file": str(video_file),
+                    "subtitle_files": subtitle_files,
+                    "chat_id": message.chat_id,
+                    "download_id": download_id,
+                    "imdb_id": imdb_id,
+                    "season": season,
+                    "episode": episode,
+                    "quality": quality,
+                    "user_id": user.id,
+                })
+                # build keyboard with language hint
+                rows = []
+                for idx, info in enumerate(subtitle_files[:10]):
+                    label = f"{info.get('name')} • {info.get('lang')}"
+                    rows.append([InlineKeyboardButton(label, callback_data=f"sub|{token}|{idx}")])
+                rows.append([InlineKeyboardButton("⛔ Sem legenda", callback_data=f"sub|{token}|-1")])
+                await status_message.edit_text(
+                    "📝 Legendas encontradas. Escolha qual legenda enviar junto (ou 'Sem legenda').",
+                    reply_markup=InlineKeyboardMarkup(rows),
+                )
+                # keep user lock until selection finished by callback or watchdog
+                release_user_lock = False
+                # start watchdog to auto-continue after 10 minutes
+                asyncio.create_task(sub_selection_watchdog(token, 600, context.bot))
+                return
+            # continue normally when automatic subtitle sent
         await status_message.edit_text("📤 Enviando vídeo no Telegram...")
         file_id, sent = await maybe_send_video(context.bot, message.chat_id, video_file, None)
         if not sent:
@@ -826,8 +1111,10 @@ async def download_and_send(
         await message.reply_text(f"❌ Falha no envio. Arquivo salvo em: {dest_dir}")
         raise exc
     finally:
-        if lock.locked():
+        if not enqueued_compression and lock.locked():
             lock.release()
+        if release_user_lock and user_lock.locked():
+            user_lock.release()
 @require_auth
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -989,6 +1276,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             episode = chat_state.get("selected_episode")
             await download_and_send(update, context, meta, stream, season=season, episode=episode)
             return
+        if action == "sub" and len(parts) == 3:
+            token = parts[1]
+            try:
+                idx = int(parts[2])
+            except (TypeError, ValueError):
+                await query.message.reply_text("❌ Opção inválida.")
+                return
+            data = get_cached_results(SUB_CACHE, token)
+            if data is None:
+                await query.message.reply_text("❌ Erro interno. A seleção expirou.")
+                return
+            chat_id = data.get("chat_id")
+            download_id = data.get("download_id")
+            user_id = data.get("user_id")
+            video_path = Path(data.get("video_file"))
+            subtitle_files = data.get("subtitle_files", [])
+            try:
+                if idx >= 0 and idx < len(subtitle_files):
+                    sub_info = subtitle_files[idx]
+                    sub_path = Path(sub_info.get("path"))
+                    await query.message.reply_text(f"📎 Enviando legenda: {sub_path.name} ({sub_info.get('lang')})")
+                    try:
+                        renamed = await send_subtitle_document(context.bot, chat_id, video_path, sub_path)
+                        logger.info("Legenda enviada: %s", renamed)
+                    except Exception:
+                        logger.exception("Erro ao enviar legenda via callback")
+                await query.message.edit_text("📤 Enviando vídeo no Telegram...")
+                file_id, sent = await maybe_send_video(context.bot, chat_id, video_path, None)
+                if sent and file_id:
+                    cache_row = db_find_cache_row(data.get("imdb_id", ""), data.get("season"), data.get("episode"), data.get("quality"))
+                    if cache_row:
+                        db_update_tg_file_id(int(cache_row["id"]), file_id)
+                db_update_download(download_id, "done")
+            except BadRequest:
+                db_update_download(download_id, "failed")
+                await query.message.reply_text(f"❌ Falha no envio. Arquivo salvo em: {video_path}")
+            except Exception:
+                logger.exception("Erro ao enviar vídeo/legenda via callback")
+                db_update_download(download_id, "failed")
+                await query.message.reply_text("❌ Falha no envio.")
+            finally:
+                # release user lock
+                user_lock = download_lock(f"user:{user_id}")
+                if user_lock.locked():
+                    try:
+                        user_lock.release()
+                    except RuntimeError:
+                        pass
+                SUB_CACHE.pop(token, None)
+            return
         if action == "back" and len(parts) >= 2:
             target = parts[1]
             if target == "search":
@@ -1032,6 +1369,14 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_search))
     application.add_error_handler(error_handler)
+    # iniciar worker de compressão em background
+    global COMPRESSION_QUEUE
+    COMPRESSION_QUEUE = asyncio.Queue()
+    try:
+        application.create_task(compression_worker(application.bot))
+    except Exception:
+        # em alguns contextos a criação da task pode ser adiada
+        pass
     return application
 
 
