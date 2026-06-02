@@ -2,27 +2,9 @@
 
 Bot Telegram em Python que busca filmes e séries via Cinemeta, lista streams do Torrentio, baixa com `aria2c`, comprime arquivos grandes com `ffmpeg` e envia o vídeo no Telegram. O projeto usa cache local em SQLite e reaproveita `tg_file_id` quando disponível.
 
-## Visão Geral do Fluxo
+### Instalação e execução — Linux (Debian/Ubuntu)
 
-1. O usuário envia `/buscar <título>` ou texto livre.
-2. O bot consulta a Cinemeta e mostra os resultados.
-3. O usuário escolhe filme/série, temporada e episódio quando aplicável.
-4. O bot consulta o Torrentio e lista os streams disponíveis.
-5. O bot baixa o torrent com `aria2c`.
-6. Se o arquivo passar de 2 GB, o bot enfileira compressão automática com `ffmpeg`.
-7. Se houver legendas, o bot prioriza `SUB_LANG` e pode enviar a legenda automaticamente ou permitir escolha manual.
-8. O vídeo é enviado ao Telegram e o `tg_file_id` é salvo no cache para uso futuro.
-
-## Iniciação
-
-### Pré-requisitos
-
-- Python 3.11+
-- `aria2c` instalado no sistema
-- `ffmpeg` instalado no sistema para compressão automática
-- Acesso a um bot do Telegram via BotFather
-
-### Instalação rápida
+Pré-requisitos (ver seção acima): Python 3.11+, `aria2c`, `ffmpeg`.
 
 ```bash
 sudo apt update
@@ -35,6 +17,143 @@ pip install -r requirements.txt
 
 cp .env.example .env
 nano .env
+```
+
+Inicialização (Linux):
+
+```bash
+mkdir -p downloads cache_db logs
+source venv/bin/activate
+python bot.py
+```
+
+Rodando como serviço systemd
+
+O arquivo [stremio-bot.service](stremio-bot.service) pode ser usado como modelo. Antes de copiar para o sistema, ajuste estes campos no arquivo:
+
+- `User=` e `Group=`: usuário Linux que executará o bot
+- `WorkingDirectory=`: caminho onde o projeto ficou instalado
+- `EnvironmentFile=`: caminho do arquivo `.env`
+- `ExecStart=`: caminho do Python dentro do `venv` e do `bot.py`
+
+Exemplo usando `/opt/stremio-bot`:
+
+```bash
+sudo mkdir -p /opt/stremio-bot
+sudo cp bot.py requirements.txt .env.example stremio-bot.service /opt/stremio-bot/
+cd /opt/stremio-bot
+
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
+nano .env
+nano stremio-bot.service
+
+sudo cp stremio-bot.service /etc/systemd/system/stremio-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable stremio-bot
+sudo systemctl start stremio-bot
+sudo systemctl status stremio-bot
+```
+
+### Instalação e execução — Windows (PowerShell / CMD)
+
+1. Instale Python 3.11+ usando o instalador oficial e marque "Add Python to PATH".
+2. Baixe os binários de `aria2` e `ffmpeg` e adicione as pastas que contêm `aria2c.exe` e `ffmpeg.exe` ao `PATH` do sistema (ou coloque os executáveis numa pasta já no PATH).
+
+Exemplo mínimo (PowerShell):
+
+```powershell
+cd C:\caminho\para\o\projeto
+python -m venv venv
+# PowerShell
+.\venv\Scripts\Activate.ps1
+# se a política bloquear: Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+# no cmd.exe: venv\Scripts\activate
+pip install -r requirements.txt
+copy .env.example .env
+notepad .env
+```
+
+Verifique se os binários estão acessíveis:
+
+```powershell
+aria2c --version
+ffmpeg -version
+python --version
+```
+
+Se precisar adicionar ao PATH via PowerShell (reabra o terminal após):
+
+```powershell
+setx PATH "$env:PATH;C:\caminho\para\bin"
+```
+
+Nota sobre ambientes e serviços:
+
+- É recomendável usar caminhos absolutos em serviços/Task Scheduler porque variáveis de ambiente do usuário podem não ser carregadas.
+- Se usar um serviço, prefira um wrapper `.bat` ou um pequeno script que ative o `venv` e execute o `bot.py` para garantir que o ambiente virtual e variáveis do projeto sejam carregados.
+
+Opções para rodar automaticamente:
+
+- Task Scheduler (embutido): crie uma tarefa básica/avançada que execute um programa;
+	- Program/script: `C:\caminho\para\venv\Scripts\python.exe`
+	- Add arguments: `C:\caminho\para\projeto\bot.py`
+	- Start in: `C:\caminho\para\projeto`
+	- Configure para "Run whether user is logged on or not" e marque "Run with highest privileges" quando necessário.
+
+- NSSM (Non-Sucking Service Manager): útil para transformar um comando em serviço Windows sem escrever código.
+
+Exemplo rápido com NSSM (Prompt/Admin):
+
+```powershell
+nssm install stremio-bot "C:\caminho\para\venv\Scripts\python.exe" "C:\caminho\para\projeto\bot.py"
+nssm set stremio-bot AppDirectory "C:\caminho\para\projeto"
+nssm start stremio-bot
+```
+
+Se usar NSSM, no painel do serviço você também pode definir variáveis de ambiente específicas para o serviço (útil para apontar `DB_PATH`, `DOWNLOAD_DIR`, etc.).
+
+Resumo: use caminhos absolutos, verifique `aria2c`/`ffmpeg`/`python` no PATH, e prefira um wrapper que ative o `venv` quando rodar como tarefa/serviço.
+```powershell
+aria2c --version
+ffmpeg -version
+python --version
+```
+
+Se precisar adicionar ao PATH via PowerShell (reabra o terminal após):
+
+```powershell
+setx PATH "$env:PATH;C:\caminho\para\bin"
+```
+
+Nota sobre ambientes e serviços:
+- É recomendável usar caminhos absolutos em serviços/Task Scheduler porque variáveis de ambiente do usuário podem não ser carregadas.
+- Se usar um serviço, prefira um wrapper `.bat` ou um pequeno script que ative o `venv` e execute o `bot.py` para garantir que o ambiente virtual e variáveis do projeto sejam carregados.
+
+Opções para rodar automaticamente:
+
+- Task Scheduler (embutido): crie uma tarefa básica/avançada que execute um programa;
+	- Program/script: `C:\caminho\para\venv\Scripts\python.exe`
+	- Add arguments: `C:\caminho\para\projeto\bot.py`
+	- Start in: `C:\caminho\para\projeto`
+	- Configure para "Run whether user is logged on or not" e marque "Run with highest privileges" quando necessário.
+
+- NSSM (Non-Sucking Service Manager): útil para transformar um comando em serviço Windows sem escrever código.
+
+Exemplo rápido com NSSM (Prompt/Admin):
+
+```powershell
+nssm install stremio-bot "C:\caminho\para\venv\Scripts\python.exe" "C:\caminho\para\projeto\bot.py"
+nssm set stremio-bot AppDirectory "C:\caminho\para\projeto"
+nssm start stremio-bot
+```
+
+Se usar NSSM, no painel do serviço você também pode definir variáveis de ambiente específicas para o serviço (útil para apontar `DB_PATH`, `DOWNLOAD_DIR`, etc.).
+
+Resumo: use caminhos absolutos, verifique `aria2c`/`ffmpeg`/`python` no PATH, e prefira um wrapper que ative o `venv` quando rodar como tarefa/serviço.
 ```
 
 ### Inicialização
