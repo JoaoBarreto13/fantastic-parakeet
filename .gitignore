@@ -151,11 +151,20 @@ activemq-data/
 .env
 .envrc
 .venv
+/.venv-1/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Editor / temporary files
+*.swp
+*.swo
+*.tmp
+*.bak
+..*.swp
+.DS_Store
 
 # Stremio bot runtime data
 /downloads/
