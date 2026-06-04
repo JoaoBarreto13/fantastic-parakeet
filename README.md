@@ -2,6 +2,15 @@
 
 Bot Telegram em Python que busca filmes e séries via Cinemeta, lista streams do Torrentio, baixa com `aria2c`, comprime arquivos grandes com `ffmpeg` e envia o vídeo no Telegram. O projeto usa cache local em SQLite e reaproveita `tg_file_id` quando disponível.
 
+## ⚠️ Projeto Pausado
+
+Este projeto encontra-se pausado devido a alterações na API utilizada, o que impossibilitou a continuidade do funcionamento do bot.
+
+Estou buscando uma nova abordagem e avaliando alternativas para substituir a dependência atual. Caso seja encontrada uma solução viável, o desenvolvimento será retomado.
+
+Enquanto isso, o repositório permanecerá disponível para consulta e estudos.
+
+
 ### Instalação e execução — Linux (Debian/Ubuntu)
 
 Pré-requisitos (ver seção acima): Python 3.11+, `aria2c`, `ffmpeg`.
